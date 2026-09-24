@@ -1,98 +1,138 @@
-# vinext-starter
+# MYTHOS Planner
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Личный планер в стиле MMORPG: цели и их шаги, книги, фильмы, проекты,
+дерево целей, привычки, статистика, серебряные и золотые монеты.
 
-## Prerequisites
+Проект разворачивается напрямую в **Cloudflare Workers** и не зависит от
+OpenAI Sites или `.openai/hosting.json`.
+
+## Что используется
+
+- Cloudflare Workers — приложение и API
+- Cloudflare D1 — цели, шаги, привычки и статистика
+- Cloudflare R2 — загруженные обложки и другие изображения
+- vinext, React и TypeScript — интерфейс и серверная часть
+
+## Требования
 
 - Node.js `>=22.13.0`
+- аккаунт Cloudflare
 
-## Quick Start
+## Локальный запуск
 
 ```bash
 npm install
+npm run db:migrate:local
 npm run dev
+```
+
+После запуска откройте адрес, который появится в терминале. Локальные данные
+Cloudflare сохраняются в папке `.wrangler`, которая не попадает в Git.
+
+## Первый деплой в Cloudflare
+
+Выполните команды по порядку:
+
+```bash
+npm run cf:login
+npm run cf:setup
+npm run deploy
+```
+
+`cf:login` откроет браузер для входа в ваш Cloudflare-аккаунт.
+`cf:setup` найдёт или создаст D1 и R2, а затем автоматически заменит тестовый
+ID базы в `wrangler.jsonc`. Команда `deploy` применит миграции к удалённой
+базе и опубликует сайт.
+
+В конце Cloudflare покажет публичный адрес вида:
+
+```text
+https://mythos-planner.<ваш-subdomain>.workers.dev
+```
+
+## Последующие обновления
+
+После изменений достаточно выполнить:
+
+```bash
+npm run deploy
+```
+
+## Полезные команды
+
+- `npm run build` — проверить production-сборку
+- `npm run lint` — проверить код
+- `npm run db:generate` — создать новую Drizzle-миграцию
+- `npm run db:migrate:local` — применить миграции к локальной D1
+- `npm run db:migrate:remote` — применить миграции к D1 в Cloudflare
+- `npm run cf:setup` — подготовить D1 и R2 для первого деплоя
+- `npm run cf:whoami` — проверить активный Cloudflare-аккаунт
+
+## Свой домен
+
+После первого деплоя откройте Cloudflare Dashboard → Workers & Pages →
+`mythos-planner` → Settings → Domains & Routes и добавьте домен.
+
+## Аккаунты, сады и карточки
+
+- `/` — каталог открытых садов; вход не требуется.
+- `/login` — вход по логину или email, регистрация, повторное письмо и восстановление пароля.
+- `/garden` — свой сад; `/garden?id=...` — просмотр выбранного сада.
+- `/account` — смена пароля, видимость сада, управление пользователями для суперадминистратора.
+- На карточках целей, проектов, книг, фильмов и шагов доступны замок, редактирование и удаление с подтверждением. Удаление цели/проекта удаляет его дочерние шаги.
+- Новые сады и карточки приватны по умолчанию. Публичная карточка внутри приватного сада остаётся закрытой. Приватность родителя скрывает его шаги. Привычки доступны владельцу и суперадминистратору.
+- Права проверяются в API, включая прямые ссылки на обложки. Суперадминистратор может просматривать и редактировать все сады, а также сбрасывать пароли. Прочитать сохранённый пароль невозможно: в базе хранится scrypt с индивидуальной солью (N=16384, r=8, p=5).
+
+### Сохранение существующих данных
+
+Миграция `0001_accounts_privacy.sql` добавляет аккаунты и назначает существующие карточки, привычки и изображения пользователю `admin` (`legacy-admin`). Его сад становится приватным. Существующие записи не удаляются. Автоматическое повторное заполнение примерами отключено: удалённые карточки больше не появляются заново.
+
+Перед применением миграции к production сохраните резервную копию D1. Используйте D1 migrations через Wrangler; Drizzle snapshot синхронизирован с новой схемой. Старые публичные обложки могли остаться в кэше браузеров до обновления; новые ответы изображений используют `private, no-store`.
+
+### Первый вход администратора
+
+Установите секрет `ADMIN_SETUP_KEY` (случайная строка не менее 32 символов):
+
+```bash
+npx wrangler secret put ADMIN_SETUP_KEY
+```
+
+После миграции войдите с логином `admin`, паролем `admin` и этим ключом в раскрывающемся блоке первого входа. Без ключа начальный вход закрыт. Затем обязательно смените пароль на свой (от 12 до 128 символов). До смены пароля API не предоставляет доступ к садам или администрированию. Ключ требуется только пока аккаунт не инициализирован; повторно сбросить пароль на `admin` им нельзя.
+
+Для локальной проверки задайте отдельный `ADMIN_SETUP_KEY` в `.dev.vars`; этот файл исключён из Git. Не используйте локальные тестовые пароли на опубликованном сайте.
+
+### Resend и подтверждение email
+
+1. Подтвердите свой домен в Resend и выберите разрешённый адрес отправителя.
+2. Установите секреты в том же Cloudflare Worker:
+
+```bash
+npx wrangler secret put RESEND_API_KEY
+npx wrangler secret put EMAIL_FROM
+npx wrangler secret put APP_URL
+```
+
+`EMAIL_FROM`: например `MYTHOS <accounts@your-domain.example>`.
+`APP_URL`: `https://mythos-planner.mythos-world.workers.dev` (без пути).
+API-ключи нельзя добавлять в Git или клиентский код.
+
+Регистрация доступна только при настроенных трёх значениях. До подтверждения email вход запрещён. Ссылки подтверждения и сброса пароля действуют час, используются однократно, в базе хранятся только их хеши. Параметры ссылок помещаются во fragment и удаляются из адресной строки после открытия. При недоставленном письме можно запросить повторную отправку.
+
+После настройки секретов примените миграции и опубликуйте: `npm run deploy`. Публикация из этой ветки автоматически не выполнялась.
+
+### Проверки
+
+```bash
+npm ci
+npm run typecheck
+npm run lint
+npm test
 npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+Тесты вызывают реальные обработчики API с SQLite в памяти и изолированными подменами D1/R2/Resend. Они проверяют миграцию непустой базы, авторизацию, одноразовые ссылки, ограничение попыток входа, запрет доступа к чужим данным, приватность родителя и сада, обложки, редактирование, каскадное удаление и отзыв сессий. Реальная отправка писем требует настроенного Resend и проверяется отдельно.
 
-## Included Shape
+### Работа из Codex Cloud
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+Подключите `pavel148/planner-website`, выберите эту ветку или слейте PR после проверки. Setup: `npm ci`; команды проверки приведены выше. Файлы `.wrangler`, `.dev.vars` и `node_modules` не синхронизируются через Git. Production-данные остаются в Cloudflare D1/R2; локальные проверки используют отдельную базу.
 
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)

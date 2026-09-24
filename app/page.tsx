@@ -1,5 +1,5 @@
-import { PlannerApp } from "./PlannerApp";
+import { Gardens } from "./Gardens";
 
 export default function Home() {
-  return <PlannerApp />;
+  return <Gardens />;
 }

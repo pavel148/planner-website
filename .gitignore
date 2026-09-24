@@ -31,6 +31,10 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+.dev.vars*
+/.test-build/
+*.tsbuildinfo
+/worker-configuration.d.ts
 
 # vercel
 .vercel
