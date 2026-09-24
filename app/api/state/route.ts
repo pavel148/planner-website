@@ -1,9 +1,20 @@
-import { ensurePlannerTables, getRuntimeDb } from "../../../db/runtime";
+import { getRuntimeDb } from "../../../db/runtime";
+import { canManage, visibleItems, type OwnedItem } from "../../../lib/access";
+import {
+  ApiError,
+  body,
+  checkOrigin,
+  fail,
+  json,
+  requireUser,
+  text,
+  viewer,
+  type User,
+} from "../../../lib/server";
 
-type PlannerRow = {
-  id: string;
+export const dynamic = "force-dynamic";
+type Item = OwnedItem & {
   type: string;
-  parent_id: string | null;
   title: string;
   description: string;
   status: string;
@@ -12,19 +23,12 @@ type PlannerRow = {
   created_at: string;
   completed_at: string | null;
 };
-
-export const dynamic = "force-dynamic";
-
-function cleanText(value: unknown, limit = 500) {
-  return typeof value === "string" ? value.trim().slice(0, limit) : "";
-}
-
-function mapItem(row: PlannerRow) {
+function mapItem(row: Item) {
   let meta = {};
   try {
-    meta = JSON.parse(row.meta || "{}");
+    meta = JSON.parse(row.meta);
   } catch {
-    meta = {};
+    /* legacy metadata */
   }
   return {
     id: row.id,
@@ -37,135 +41,269 @@ function mapItem(row: PlannerRow) {
     meta,
     createdAt: row.created_at,
     completedAt: row.completed_at,
+    isPrivate: !!row.is_private,
   };
 }
-
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    await ensurePlannerTables();
+    const user = await viewer(request);
+    if (user?.must_change_password)
+      throw new ApiError("Сначала смените временный пароль.", 403);
     const db = getRuntimeDb();
-    const [itemsResult, habitsResult, entriesResult] = await Promise.all([
-      db.prepare("SELECT * FROM planner_items ORDER BY created_at, id").all<PlannerRow>(),
-      db.prepare("SELECT * FROM habits ORDER BY created_at, id").all(),
-      db.prepare("SELECT habit_id AS habitId, day FROM habit_entries ORDER BY day").all(),
-    ]);
-    return Response.json({
-      items: itemsResult.results.map(mapItem),
-      habits: habitsResult.results,
-      entries: entriesResult.results,
+    const ownerId = new URL(request.url).searchParams.get("garden") || user?.id;
+    if (!ownerId) throw new ApiError("Выберите сад или войдите.", 401);
+    const owner = await db
+      .prepare("SELECT * FROM users WHERE id=? AND email_verified=1")
+      .bind(ownerId)
+      .first<User>();
+    if (!owner || (owner.garden_private && !canManage(user, ownerId)))
+      throw new ApiError("Сад не найден или закрыт.", 404);
+    const result = await db
+      .prepare(
+        "SELECT * FROM planner_items WHERE owner_id=? ORDER BY created_at,id",
+      )
+      .bind(ownerId)
+      .all<Item>();
+    const editable = canManage(user, ownerId);
+    const [habits, entries] = editable
+      ? await Promise.all([
+          db
+            .prepare(
+              "SELECT id,title,icon,color FROM habits WHERE owner_id=? ORDER BY created_at,id",
+            )
+            .bind(ownerId)
+            .all(),
+          db
+            .prepare(
+              "SELECT e.habit_id AS habitId,e.day FROM habit_entries e JOIN habits h ON h.id=e.habit_id WHERE h.owner_id=? ORDER BY e.day",
+            )
+            .bind(ownerId)
+            .all(),
+        ])
+      : [{ results: [] }, { results: [] }];
+    return json({
+      items: visibleItems(
+        result.results,
+        user,
+        ownerId,
+        owner.garden_private,
+      ).map(mapItem),
+      habits: habits.results,
+      entries: entries.results,
+      garden: {
+        id: owner.id,
+        username: owner.username,
+        isPrivate: !!owner.garden_private,
+      },
+      editable,
     });
   } catch (error) {
-    return Response.json(
-      { error: error instanceof Error ? error.message : "Не удалось открыть планер." },
-      { status: 500 }
-    );
+    return fail(error);
   }
 }
-
+function metadata(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new ApiError("Некорректные поля карточки.");
+  const result: Record<string, string | number> = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (
+      [
+        "author",
+        "year",
+        "plus",
+        "minus",
+        "difficulty",
+        "category",
+        "rune",
+        "cover",
+      ].includes(key)
+    )
+      result[key] = text(val, 500);
+    if (key === "rating") {
+      if (!Number.isInteger(Number(val)) || Number(val) < 0 || Number(val) > 5)
+        throw new ApiError("Оценка: от 0 до 5.");
+      result.rating = Number(val);
+    }
+  }
+  return JSON.stringify(result);
+}
 export async function POST(request: Request) {
   try {
-    await ensurePlannerTables();
+    checkOrigin(request);
+    const user = await requireUser(request);
+    const data = await body(request);
     const db = getRuntimeDb();
-    const payload = (await request.json()) as Record<string, unknown>;
-    const action = cleanText(payload.action, 40);
-
+    const action = text(data.action, 40);
+    const ownerId = text(data.gardenId, 80) || user.id;
+    if (!canManage(user, ownerId))
+      throw new ApiError("Нет доступа к этому саду.", 403);
+    if (
+      !(await db
+        .prepare("SELECT id FROM users WHERE id=?")
+        .bind(ownerId)
+        .first())
+    )
+      throw new ApiError("Сад не найден.", 404);
     if (action === "create_item") {
-      const allowed = new Set(["goal", "project", "step", "book", "film"]);
-      const type = cleanText(payload.type, 20);
-      const title = cleanText(payload.title, 120);
-      if (!allowed.has(type) || !title) {
-        return Response.json({ error: "Укажите название и тип записи." }, { status: 400 });
-      }
+      const type = text(data.type, 20),
+        title = text(data.title);
+      if (!["goal", "project", "step", "book", "film"].includes(type) || !title)
+        throw new ApiError("Укажите название и тип записи.");
+      const parent = type === "step" ? text(data.parentId, 80) : null;
+      if (
+        type === "step" &&
+        (!parent ||
+          !(await db
+            .prepare(
+              "SELECT id FROM planner_items WHERE id=? AND owner_id=? AND type IN ('goal','project')",
+            )
+            .bind(parent, ownerId)
+            .first()))
+      )
+        throw new ApiError("Выберите цель или проект в этом саду.");
       const id = crypto.randomUUID();
-      const parentId = cleanText(payload.parentId, 80) || null;
-      const description = cleanText(payload.description, 1000);
-      const meta =
-        payload.meta && typeof payload.meta === "object"
-          ? JSON.stringify(payload.meta).slice(0, 4000)
-          : "{}";
       await db
         .prepare(
-          `INSERT INTO planner_items
-          (id, type, parent_id, title, description, status, meta)
-          VALUES (?, ?, ?, ?, ?, 'active', ?)`
+          "INSERT INTO planner_items (id,type,parent_id,title,description,meta,owner_id,is_private) VALUES (?,?,?,?,?,?,?,?)",
         )
-        .bind(id, type, parentId, title, description, meta)
+        .bind(
+          id,
+          type,
+          parent,
+          title,
+          text(data.description, 1000),
+          metadata(data.meta || {}),
+          ownerId,
+          data.isPrivate === false ? 0 : 1,
+        )
         .run();
-      return Response.json({ ok: true, id }, { status: 201 });
+      return json({ ok: true, id }, 201);
     }
-
-    if (action === "toggle_item") {
-      const id = cleanText(payload.id, 80);
+    if (
+      ["toggle_item", "update_item", "delete_item", "privacy_item"].includes(
+        action,
+      )
+    ) {
+      const id = text(data.id, 80);
       const current = await db
-        .prepare("SELECT status FROM planner_items WHERE id = ?")
-        .bind(id)
-        .first<{ status: string }>();
-      if (!current) return Response.json({ error: "Запись не найдена." }, { status: 404 });
-      const next = current.status === "completed" ? "active" : "completed";
-      await db
-        .prepare(
-          "UPDATE planner_items SET status = ?, completed_at = ? WHERE id = ?"
+        .prepare("SELECT * FROM planner_items WHERE id=? AND owner_id=?")
+        .bind(id, ownerId)
+        .first<Item>();
+      if (!current) throw new ApiError("Запись не найдена.", 404);
+      if (action === "delete_item") {
+        await db
+          .prepare(
+            `WITH RECURSIVE descendants(id) AS (SELECT id FROM planner_items WHERE id=? AND owner_id=?
+        UNION SELECT i.id FROM planner_items i JOIN descendants d ON i.parent_id=d.id WHERE i.owner_id=?)
+        DELETE FROM planner_items WHERE id IN (SELECT id FROM descendants) AND owner_id=?`,
+          )
+          .bind(id, ownerId, ownerId, ownerId)
+          .run();
+      } else if (action === "toggle_item") {
+        const status = current.status === "completed" ? "active" : "completed";
+        await db
+          .prepare(
+            "UPDATE planner_items SET status=?,completed_at=? WHERE id=? AND owner_id=?",
+          )
+          .bind(
+            status,
+            status === "completed" ? new Date().toISOString() : null,
+            id,
+            ownerId,
+          )
+          .run();
+      } else if (action === "privacy_item") {
+        if (typeof data.isPrivate !== "boolean")
+          throw new ApiError("Укажите видимость карточки.");
+        await db
+          .prepare(
+            "UPDATE planner_items SET is_private=? WHERE id=? AND owner_id=?",
+          )
+          .bind(Number(data.isPrivate), id, ownerId)
+          .run();
+      } else {
+        const title =
+          data.title === undefined ? current.title : text(data.title);
+        if (!title) throw new ApiError("Название не может быть пустым.");
+        const image =
+          data.imageKey === undefined
+            ? current.image_key
+            : text(data.imageKey, 180) || null;
+        if (
+          image &&
+          image !== current.image_key &&
+          !(await db
+            .prepare("SELECT key FROM uploads WHERE key=? AND owner_id=?")
+            .bind(image, user.id)
+            .first())
         )
-        .bind(next, next === "completed" ? new Date().toISOString() : null, id)
-        .run();
-      return Response.json({ ok: true, status: next });
-    }
-
-    if (action === "update_item") {
-      const id = cleanText(payload.id, 80);
-      const imageKey = cleanText(payload.imageKey, 180) || null;
-      const description =
-        typeof payload.description === "string"
-          ? cleanText(payload.description, 1000)
-          : null;
-      if (description !== null) {
+          throw new ApiError("Обложка недоступна.", 403);
+        const status =
+          data.status === undefined ? current.status : text(data.status, 20);
+        if (!["active", "completed"].includes(status))
+          throw new ApiError("Неизвестный статус.");
         await db
-          .prepare("UPDATE planner_items SET description = ?, image_key = COALESCE(?, image_key) WHERE id = ?")
-          .bind(description, imageKey, id)
-          .run();
-      } else {
-        await db
-          .prepare("UPDATE planner_items SET image_key = ? WHERE id = ?")
-          .bind(imageKey, id)
+          .prepare(
+            "UPDATE planner_items SET title=?,description=?,meta=?,image_key=?,status=?,completed_at=? WHERE id=? AND owner_id=?",
+          )
+          .bind(
+            title,
+            data.description === undefined
+              ? current.description
+              : text(data.description, 1000),
+            data.meta === undefined ? current.meta : metadata(data.meta),
+            image,
+            status,
+            status === "completed"
+              ? current.completed_at || new Date().toISOString()
+              : null,
+            id,
+            ownerId,
+          )
           .run();
       }
-      return Response.json({ ok: true });
+      return json({ ok: true });
     }
-
     if (action === "create_habit") {
-      const title = cleanText(payload.title, 100);
-      if (!title) return Response.json({ error: "Введите название привычки." }, { status: 400 });
-      const id = crypto.randomUUID();
+      const title = text(data.title, 100);
+      if (!title) throw new ApiError("Введите название привычки.");
       await db
-        .prepare("INSERT INTO habits (id, title, icon, color) VALUES (?, ?, '✦', 'violet')")
-        .bind(id, title)
+        .prepare("INSERT INTO habits (id,title,owner_id) VALUES (?,?,?)")
+        .bind(crypto.randomUUID(), title, ownerId)
         .run();
-      return Response.json({ ok: true, id }, { status: 201 });
+      return json({ ok: true }, 201);
     }
-
     if (action === "toggle_habit") {
-      const habitId = cleanText(payload.habitId, 80);
-      const day = cleanText(payload.day, 10);
+      const habit = text(data.habitId, 80),
+        day = text(data.day, 10);
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(day) ||
+        !(await db
+          .prepare("SELECT id FROM habits WHERE id=? AND owner_id=?")
+          .bind(habit, ownerId)
+          .first())
+      )
+        throw new ApiError("Привычка или дата недоступна.", 404);
       const existing = await db
-        .prepare("SELECT id FROM habit_entries WHERE habit_id = ? AND day = ?")
-        .bind(habitId, day)
+        .prepare("SELECT id FROM habit_entries WHERE habit_id=? AND day=?")
+        .bind(habit, day)
         .first<{ id: number }>();
-      if (existing) {
-        await db.prepare("DELETE FROM habit_entries WHERE id = ?").bind(existing.id).run();
-      } else {
+      if (existing)
         await db
-          .prepare("INSERT INTO habit_entries (habit_id, day) VALUES (?, ?)")
-          .bind(habitId, day)
+          .prepare("DELETE FROM habit_entries WHERE id=?")
+          .bind(existing.id)
           .run();
-      }
-      return Response.json({ ok: true, checked: !existing });
+      else
+        await db
+          .prepare(
+            "INSERT OR IGNORE INTO habit_entries (habit_id,day) VALUES (?,?)",
+          )
+          .bind(habit, day)
+          .run();
+      return json({ ok: true });
     }
-
-    return Response.json({ error: "Неизвестное действие." }, { status: 400 });
+    throw new ApiError("Неизвестное действие.");
   } catch (error) {
-    return Response.json(
-      { error: error instanceof Error ? error.message : "Не удалось сохранить изменения." },
-      { status: 500 }
-    );
+    return fail(error);
   }
 }
