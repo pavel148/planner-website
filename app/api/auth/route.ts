@@ -5,6 +5,7 @@ import {
   digest,
   token,
   sameSecret,
+  DUMMY_PASSWORD_HASH,
 } from "../../../lib/passwords";
 import {
   ApiError,
@@ -148,9 +149,10 @@ export async function POST(request: Request) {
           throw new ApiError("Аккаунт уже настроен. Повторите вход.", 409);
         user = { ...user, password_hash: hash };
       }
-      const dummy =
-        "pbkdf2$600000$00000000000000000000000000000000$" + "00".repeat(32);
-      const valid = await verifyPassword(pass, user?.password_hash || dummy);
+      const valid = await verifyPassword(
+        pass,
+        user?.password_hash || DUMMY_PASSWORD_HASH,
+      );
       if (!user || !valid)
         throw new ApiError("Неверный логин или пароль.", 401);
       if (!user.email_verified)
